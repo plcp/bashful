@@ -1,0 +1,346 @@
+#!/bin/bash
+
+dir="$(mktemp -d)"
+trap "rm -rf $dir" EXIT
+
+gdb_will_attach="$(
+    gdb --batch -ex "attach $PPID" -ex "print find_variable" \
+        |& egrep '^.. = .*<find_variable>')"
+
+gdb="gdb"
+test -z "$gdb_will_attach" && gdb="sudo gdb"
+
+t="$(tput sgr0)    "
+arg="$(tput bold)$0"
+name="$1"
+shift
+
+if [ -z "$name" ];
+then
+    echo -e Versatile redneck bash utility. "\n"
+    echo "Usage:"
+    echo -e "$t$arg"
+    echo -e "$t$t" Display this help.
+    echo -e "$t$arg" "<name>"
+    echo -e "$t$t" List tags of '<name>'.
+    echo -e "$t$arg" "<name> [tags...]"
+    echo -e "$t$t" Replace tags of '<name>' by the provided tag list.
+    echo -e "$t$arg" "<name> dynamic[-debug] <cmdline>"
+    echo -e "$t$t" Evaluate '<cmdline>' when '$<name>' is evaluated.
+    echo
+    echo "Available tags:"
+    echo -e "$t" clean      "\t\t"  '(no tag specified)'
+    echo -e "$t" exported   "\t\t"  export to environment
+    echo -e "$t" readonly   "\t\t"  cannot change
+    echo -e "$t" array      "\t\t"  value is an array
+    echo -e "$t" function   "\t\t"  value is a function
+    echo -e "$t" integer    "\t\t"  internal representation is int
+    echo -e "$t" local      "\t\t"  variable is local to a function
+    echo -e "$t" assoc      "\t\t"  variable is an associative array
+    echo -e "$t" trace      "\t\t"  function is traced with DEBUG nrap
+    echo -e "$t" uppercase  "\t\t"  word converted to uppercase on assignment
+    echo -e "$t" lowercase  "\t\t"  word converted to lowercase on assignment
+    echo -e "$t" capcase    "\t\t"  word capitalized on assignment
+    echo -e "$t" nameref    "\t\t"  word is a name reference
+    echo -e "$t" invisible  "\t\t"  cannot see
+    echo -e "$t" nounset    "\t\t"  cannot unset
+    echo -e "$t" noassign   "\t\t"  assignment not allowed
+    echo -e "$t" imported   "\t\t"  came from environment
+    echo -e "$t" special    "\t\t"  requires special handling
+    echo -e "$t" nofree     "\t\t"  do not free value on unset
+    echo -e "$t" tempvar    "\t\t"  variable came from the temp environment
+    echo -e "$t" propagate  "\t\t"  propagate to previous scope
+    echo
+    exit
+fi
+
+var="$(
+    $gdb --batch -ex "attach $PPID" -ex "print find_variable(\"$name\")" \
+        |& egrep '\$1 = [0-9]{2,}')"
+test -z "$var" && echo "Variable $name not set." && exit
+
+if [ -z "$1" ];
+then
+    raw="$($gdb --batch -ex "attach $PPID" \
+        -ex "print *(int*)(find_variable(\"$name\")+sizeof(char*)*5)" \
+        |& tail -n 1)"
+    read flags < <(echo "$raw"|sed 's/$1 = //g')
+
+    [ $((0x0000001 & $flags)) -ne 0 ] && echo exported
+    [ $((0x0000002 & $flags)) -ne 0 ] && echo readonly
+    [ $((0x0000004 & $flags)) -ne 0 ] && echo array
+    [ $((0x0000008 & $flags)) -ne 0 ] && echo function
+    [ $((0x0000010 & $flags)) -ne 0 ] && echo integer
+    [ $((0x0000020 & $flags)) -ne 0 ] && echo local
+    [ $((0x0000040 & $flags)) -ne 0 ] && echo assoc
+    [ $((0x0000080 & $flags)) -ne 0 ] && echo trace
+    [ $((0x0000100 & $flags)) -ne 0 ] && echo uppercase
+    [ $((0x0000200 & $flags)) -ne 0 ] && echo lowercase
+    [ $((0x0000400 & $flags)) -ne 0 ] && echo capcase
+    [ $((0x0000800 & $flags)) -ne 0 ] && echo nameref
+    [ $((0x0001000 & $flags)) -ne 0 ] && echo invisible
+    [ $((0x0002000 & $flags)) -ne 0 ] && echo nounset
+    [ $((0x0004000 & $flags)) -ne 0 ] && echo noassign
+    [ $((0x0008000 & $flags)) -ne 0 ] && echo imported
+    [ $((0x0010000 & $flags)) -ne 0 ] && echo special
+    [ $((0x0020000 & $flags)) -ne 0 ] && echo nofree
+    [ $((0x0100000 & $flags)) -ne 0 ] && echo tempvar
+    [ $((0x0200000 & $flags)) -ne 0 ] && echo propagate
+
+    exit
+fi
+
+debug="false"
+if [ "$1" == "dynamic-debug" ];
+then
+    shift
+    set dynamic "$@"
+    debug="true"
+fi
+
+if [ "$1" == "dynamic" ];
+then
+    shareable="$(mktemp -u sXXXXXXXX)"
+    cfile="$(mktemp -p "$dir" "src_${shareable}_XXXXXXXX.c")"
+    ofile="$(mktemp -p "$dir" "obj_${shareable}_XXXXXXXX.o")"
+    sfile="$(mktemp -p "$dir" "lib_${shareable}_XXXXXXXX.so")"
+
+    mkdir -p "$dir"
+    (cat > "$cfile") <<- __EOF__
+        #include <errno.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <unistd.h>
+        #include <sys/wait.h>
+
+        struct word_desc {
+            char* word;
+            int flags;
+        };
+
+        struct word_list {
+            struct word_list* next;
+            struct word_desc* word;
+        };
+
+        typedef int sh_builtin_func_t(struct word_list *);
+
+        struct builtin {
+            char *name;
+            sh_builtin_func_t* fun;
+            int flags;
+            char* const* ldoc;
+            const char* sdoc;
+            char* unused;
+        };
+
+        struct variable {
+            char* name;
+            char* value;
+            char* exportstr;
+            void* gfunc;
+            void* afunc;
+            int attr;
+            int ctxt;
+        };
+
+        struct variable* redneck_builtin(struct variable* var)
+        {
+            char cmd[] = ____INSERT_CMD_HERE____;
+            char* argv[] = {cmd, ____INSERT_ARGV_HERE____(char*) 0};
+
+            int fds[2];
+            if(pipe(fds) == -1)
+            {
+                exit(1);
+            }
+
+            pid_t pid = fork();
+            if(pid == -1)
+            {
+                exit(2);
+            }
+
+            if(pid == 0)
+            {
+                while((dup2(fds[1], STDOUT_FILENO) == -1) && (errno == EINTR))
+                {
+                    ;
+                }
+
+                close(fds[1]);
+                close(fds[0]);
+                execvp(cmd, argv);
+                exit(3);
+            }
+            close(fds[1]);
+
+            ssize_t offset = 0;
+            char buffer[8192];
+            while(1)
+            {
+                ssize_t nbytes = read(fds[0], buffer, sizeof(buffer));
+                if(nbytes == -1)
+                {
+                    if(errno == EINTR)
+                    {
+                        continue;
+                    }
+                    else
+                    {
+                        exit(4);
+                    }
+                }
+                else if(nbytes == 0)
+                {
+                    break;
+                }
+                else
+                {
+                    var->value = (char*) realloc(
+                        var->value,
+                        nbytes + offset + 1);
+                    for(ssize_t i = 0; i < nbytes; ++i)
+                    {
+                        var->value[i + offset] = buffer[i];
+                    }
+                    var->value[nbytes + offset] = '\0';
+                    offset = nbytes + offset;
+                }
+            }
+            close(fds[0]);
+
+            wait(0);
+            return var;
+        }
+
+        char *redneck_doc[] = {
+            "(may segfault your shell when called from command line)",
+            (char*) 0
+        };
+
+        struct builtin redneck_struct = {
+            "redneck",
+            (sh_builtin_func_t*) redneck_builtin,
+            1,
+            redneck_doc,
+            "Loadable builtin for fun & profit.",
+            0,
+        };
+__EOF__
+
+    shift
+    test -z "$1" && echo "No command line specified." && exit
+
+    b="$(echo -ne "\x02")"
+    read -r cmd < <(echo "$1"|sed "s/\\\\/$b/g"|sed 's/"/\\\\"/g')
+    cmd="\"$cmd\""
+
+    shift
+    argv=""
+    while [ -n "$1" ];
+    do
+        read -r sarg < <(echo "$1"|sed "s/\\\\/$b/g"|sed 's/"/\\\\"/g')
+        argv="$argv\"$sarg\", "
+        shift
+    done
+    echo "Injecting [$cmd $argv]..."
+    echo "$cmd$argv" | grep -q '\\' && \
+        echo "($arg:" 'for C-escaped sequences, you have to escape two times:'\
+                ' "\\n" will work, "\n" will not)'"$t"
+    echo ""
+
+    d="$(echo -ne "\x01")"
+    sed --sandbox -i "s${d}redneck${d}$shareable${d}g" "$cfile"
+    sed --sandbox -i "s${d}____INSERT_CMD_HERE____${d}$cmd${d}g" "$cfile"
+    sed --sandbox -i "s${d}____INSERT_ARGV_HERE____${d}$argv${d}g" "$cfile"
+    sed --sandbox -i "s${d}$b${d}\\\\\\\\${d}g" "$cfile"
+
+    cd "$dir"
+    while true;
+    do
+        if $debug;
+        then
+            gcc -c "$cfile" -o "$ofile"
+            echo "Press enter to debug (^D to continue)..."
+            read || break
+            $EDITOR "$cfile"
+        else
+            gcc -c "$cfile" -o "$ofile" && break
+
+            echo "Press enter to edit (^D to quit)..."
+            read || exit 1
+            $EDITOR "$cfile"
+        fi
+    done
+
+    ld -x -Bshareable -o "$sfile" "$ofile"
+
+    $gdb --batch -ex "attach $PPID" \
+        -ex "call evalstring(\"enable -f $sfile $shareable\", 0, 0)" \
+        &> /dev/null
+
+    exgdb="set *(char**)(find_variable(\"$name\")+sizeof(char*)*3)"
+    exgdb="$exgdb = ((char*) ${shareable}_builtin)"
+    $gdb --batch -ex "attach $PPID" -ex "$exgdb" &> /dev/null
+
+    rm "$cfile" "$ofile"
+    exit
+fi
+
+flag=0
+while test -n "$1";
+do
+    nflag="0"
+    case "$1" in
+        clean)
+            nflag=0x0000000 ;; # no flag set
+        exported)
+            nflag=0x0000001 ;; # export to environment
+        readonly)
+            nflag=0x0000002 ;; # cannot change
+        array)
+            nflag=0x0000004 ;; # value is an array
+        function)
+            nflag=0x0000008 ;; # value is a function
+        integer)
+            nflag=0x0000010 ;; # internal representation is int
+        local)
+            nflag=0x0000020 ;; # variable is local to a function
+        assoc)
+            nflag=0x0000040 ;; # variable is an associative array
+        trace)
+            nflag=0x0000080 ;; # function is traced with DEBUG trap
+        uppercase)
+            nflag=0x0000100 ;; # word converted to uppercase on assignment
+        lowercase)
+            nflag=0x0000200 ;; # word converted to lowercase on assignment
+        capcase)
+            nflag=0x0000400 ;; # word capitalized on assignment
+        nameref)
+            nflag=0x0000800 ;; # word is a name reference
+        invisible)
+            nflag=0x0001000 ;; # cannot see
+        nounset)
+            nflag=0x0002000 ;; # cannot unset
+        noassign)
+            nflag=0x0004000 ;; # assignment not allowed
+        imported)
+            nflag=0x0008000 ;; # came from environment
+        special)
+            nflag=0x0010000 ;; # requires special handling
+        nofree)
+            nflag=0x0020000 ;; # do not free value on unset
+        tempvar)
+            nflag=0x0100000 ;; # variable came from the temp environment
+        propagate)
+            nflag=0x0200000 ;; # propagate to previous scope
+    esac
+    flag="$(($flag + $nflag))"
+    shift
+done
+
+$gdb --batch -ex "attach $PPID" \
+    -ex "set *(int*)(find_variable(\"$name\")+sizeof(char*)*5) = $flag" \
+    -ex 'set array_needs_making = 1' &> /dev/null
+
