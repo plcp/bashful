@@ -55,15 +55,15 @@ then
 fi
 
 var="$(
-    $gdb --batch -ex "attach $PPID" -ex "print find_variable(\"$name\")" \
+    $gdb --batch -ex "attach $PPID" -ex "print (long long unsigned int) find_variable(\"$name\")" \
         |& egrep '\$1 = [0-9]{2,}')"
 test -z "$var" && echo "Variable $name not set." && exit
 
 if [ -z "$1" ];
 then
     raw="$($gdb --batch -ex "attach $PPID" \
-        -ex "print *(int*)(find_variable(\"$name\")+sizeof(char*)*5)" \
-        |& tail -n 1)"
+        -ex "print *(int*)((long long unsigned) find_variable(\"$name\")+sizeof(char*)*5)" \
+        |& egrep '\$1 = [0-9]*')"
     read flags < <(echo "$raw"|sed 's/$1 = //g')
 
     [ $((0x0000001 & $flags)) -ne 0 ] && echo exported
@@ -233,6 +233,7 @@ __EOF__
     test -z "$1" && echo "No command line specified." && exit
 
     b="$(echo -ne "\x02")"
+    d="$(echo -ne "\x01")"
     read -r cmd < <(echo "$1"|sed "s/\\\\/$b/g"|sed 's/"/\\\\"/g')
     cmd="\"$cmd\""
 
@@ -240,17 +241,17 @@ __EOF__
     argv=""
     while [ -n "$1" ];
     do
-        read -r sarg < <(echo "$1"|sed "s/\\\\/$b/g"|sed 's/"/\\\\"/g')
+        read -d "$d" -r sarg < <(echo "$1$d"|sed 's/\\/'"$b/g"|sed 's/"/\\\\"/g')
         argv="$argv\"$sarg\", "
         shift
     done
-    echo "Injecting [$cmd $argv]..."
+    echo " > Injecting [$cmd $argv] in \$$name..."
     echo "$cmd$argv" | grep -q '\\' && \
         echo "($arg:" 'for C-escaped sequences, you have to escape two times:'\
                 ' "\\n" will work, "\n" will not)'"$t"
-    echo ""
 
-    d="$(echo -ne "\x01")"
+    if $debug; then echo ""; fi;
+
     sed --sandbox -i "s${d}redneck${d}$shareable${d}g" "$cfile"
     sed --sandbox -i "s${d}____INSERT_CMD_HERE____${d}$cmd${d}g" "$cfile"
     sed --sandbox -i "s${d}____INSERT_ARGV_HERE____${d}$argv${d}g" "$cfile"
@@ -277,10 +278,10 @@ __EOF__
     ld -x -Bshareable -o "$sfile" "$ofile"
 
     $gdb --batch -ex "attach $PPID" \
-        -ex "call evalstring(\"enable -f $sfile $shareable\", 0, 0)" \
+        -ex "call (void) evalstring(\"enable -f $sfile $shareable\", 0, 0)" \
         &> /dev/null
 
-    exgdb="set *(char**)(find_variable(\"$name\")+sizeof(char*)*3)"
+    exgdb="set *(char**)((long long unsigned) find_variable(\"$name\")+sizeof(char*)*3)"
     exgdb="$exgdb = ((char*) ${shareable}_builtin)"
     $gdb --batch -ex "attach $PPID" -ex "$exgdb" &> /dev/null
 
@@ -335,12 +336,14 @@ do
             nflag=0x0100000 ;; # variable came from the temp environment
         propagate)
             nflag=0x0200000 ;; # propagate to previous scope
+        *)
+            echo "WARNING: $1 flag is unknown!" > /dev/stderr
     esac
     flag="$(($flag + $nflag))"
     shift
 done
 
 $gdb --batch -ex "attach $PPID" \
-    -ex "set *(int*)(find_variable(\"$name\")+sizeof(char*)*5) = $flag" \
+    -ex "set *(int*)((long long unsigned) find_variable(\"$name\")+sizeof(char*)*5) = $flag" \
     -ex 'set array_needs_making = 1' &> /dev/null
 
